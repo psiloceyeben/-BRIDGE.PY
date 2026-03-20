@@ -30,7 +30,8 @@ from pathlib import Path
 def _bootstrap_deps():
     """Install missing packages before importing them."""
     required = {"numpy": "numpy", "uvicorn": "uvicorn", "dotenv": "python-dotenv",
-                "fastapi": "fastapi", "anthropic": "anthropic", "openai": "openai"}
+                "fastapi": "fastapi", "anthropic": "anthropic", "openai": "openai",
+                "telegram": "python-telegram-bot"}
     missing = []
     for mod, pkg in required.items():
         try:
@@ -71,9 +72,9 @@ BUILD_TOKEN        = os.environ.get("BUILD_TOKEN", "")
 PORT               = int(os.environ.get("PORT", "8000"))
 
 try:
-    MAX_TOKENS = int(os.environ.get("BRIDGE_MAX_TOKENS", "4096"))
+    MAX_TOKENS = int(os.environ.get("BRIDGE_MAX_TOKENS", "16384"))
 except (ValueError, TypeError):
-    MAX_TOKENS = 4096
+    MAX_TOKENS = 16384
 
 try:
     HEARTBEAT_INTERVAL = int(os.environ.get("BRIDGE_HEARTBEAT_MIN", "30")) * 60
@@ -1203,22 +1204,43 @@ async def _operator_loop(session_id: str, history: list, system: str) -> dict:
         ]})
         i += 2
 
-    for _turn in range(MAX_TOOL_TURNS):
-        resp = await asyncio.to_thread(lambda: client.messages.create(
-            model=BRIDGE_MODEL, max_tokens=MAX_TOKENS,
-            system=system, tools=OPERATOR_TOOLS,
-            messages=history, timeout=120,
-        ))
+    # Scrub empty content blocks from history before sending
+    for msg in history:
+        c = msg.get("content")
+        if isinstance(c, list) and len(c) == 0:
+            msg["content"] = [{"type": "text", "text": "(empty)"}] if msg.get("role") == "assistant" else "(continue)"
+        if isinstance(c, str) and not c.strip():
+            msg["content"] = "(continue)"
 
-        # Pure text reply
-        if resp.stop_reason == "end_turn":
-            text = " ".join(b.text for b in resp.content if hasattr(b, "text")).strip()
+    for _turn in range(MAX_TOOL_TURNS):
+        try:
+            resp = await asyncio.to_thread(lambda: client.messages.create(
+                model=BRIDGE_MODEL, max_tokens=MAX_TOKENS,
+                system=system, tools=OPERATOR_TOOLS,
+                messages=history, timeout=120,
+            ))
+        except Exception as e:
+            log.error(f"OPERATOR LOOP API error: {e}")
+            return {"done": True, "reply": f"(API error: {type(e).__name__}: {str(e)[:200]})"}
+
+        # Pure text reply — end_turn OR max_tokens with text content
+        text_blocks = [b for b in resp.content if hasattr(b, "text") and b.text.strip()]
+        tool_blocks = [b for b in resp.content if b.type == "tool_use"]
+
+        if resp.stop_reason == "end_turn" or (resp.stop_reason == "max_tokens" and text_blocks and not tool_blocks):
+            text = " ".join(b.text for b in text_blocks).strip()
+            if not text:
+                text = "(model returned empty response — try again)"
             history.append({"role": "assistant", "content": [{"type": "text", "text": text}]})
             return {"done": True, "reply": text}
 
-        # Tool use
-        if resp.stop_reason == "tool_use":
-            history.append({"role": "assistant", "content": [_serialize_block(b) for b in resp.content]})
+        # Tool use — explicit tool_use OR max_tokens mid-tool-call
+        if resp.stop_reason in ("tool_use", "max_tokens") and tool_blocks:
+            serialized = [_serialize_block(b) for b in resp.content]
+            serialized = [b for b in serialized if b]  # drop None/empty
+            if not serialized:
+                serialized = [{"type": "text", "text": "(empty response)"}]
+            history.append({"role": "assistant", "content": serialized})
 
             tool_calls = [b for b in resp.content if b.type == "tool_use"]
             safe_calls = [t for t in tool_calls if t.name in SAFE_TOOLS]
@@ -1252,8 +1274,14 @@ async def _operator_loop(session_id: str, history: list, system: str) -> dict:
             _trim_history(history)
             continue
 
-        break
-    return {"done": True, "reply": "(no response)"}
+        # Unknown stop reason — extract whatever text exists
+        text = " ".join(b.text for b in resp.content if hasattr(b, "text") and b.text.strip()).strip()
+        if text:
+            history.append({"role": "assistant", "content": [{"type": "text", "text": text}]})
+            return {"done": True, "reply": text}
+        log.warning(f"OPERATOR LOOP: unexpected stop_reason={resp.stop_reason}, no text. Retrying.")
+        continue
+    return {"done": True, "reply": "(max tool turns reached — try a simpler request)"}
 
 
 def _load_context() -> str:
@@ -1991,11 +2019,484 @@ async def startup():
         log.info("BRIDGE started — no vessel. Visit /setup to create one.")
 
 
-if __name__ == "__main__":
-    if not (VESSEL_DIR / "VESSEL.md").exists() and sys.stdin.isatty():
-        _init_dirs()
+async def _cli_loop():
+    """Interactive terminal REPL — the primary way to use The Bridge."""
+    _init_dirs()
+    _init_vault()
+    _generate_default_tree()
+    _load_plugins()
+
+    if not (VESSEL_DIR / "VESSEL.md").exists():
         _auto_init_tty()
         _generate_default_tree()
         _init_vault()
 
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    # Start background loops
+    asyncio.create_task(_heartbeat_loop())
+    asyncio.create_task(_substrate_loop())
+
+    ctx = load_vessel()
+    vessel_name = "VESSEL"
+    for line in ctx["vessel"].split("\n"):
+        if line.startswith("# "):
+            vessel_name = line[2:].strip()
+            break
+
+    # Show banner
+    print(f"""
+\033[36m    ╔══════════════════════════════════════════════════════════════╗
+    ║                                                              ║
+    ║   ████████╗██╗  ██╗███████╗                                  ║
+    ║      ██╔══╝██║  ██║██╔════╝                                  ║
+    ║      ██║   ███████║█████╗                                    ║
+    ║      ██║   ██╔══██║██╔══╝                                    ║
+    ║      ██║   ██║  ██║███████╗                                  ║
+    ║      ╚═╝   ╚═╝  ╚═╝╚══════╝                                 ║
+    ║   ██████╗ ██████╗ ██╗██████╗  ██████╗ ███████╗               ║
+    ║   ██╔══██╗██╔══██╗██║██╔══██╗██╔════╝ ██╔════╝              ║
+    ║   ██████╔╝██████╔╝██║██║  ██║██║  ███╗█████╗                ║
+    ║   ██╔══██╗██╔══██╗██║██║  ██║██║   ██║██╔══╝                ║
+    ║   ██████╔╝██║  ██║██║██████╔╝╚██████╔╝███████╗              ║
+    ║   ╚═════╝ ╚═╝  ╚═╝╚═╝╚═════╝  ╚═════╝ ╚══════╝             ║
+    ║                                                              ║
+    ║\033[0m\033[33m   cognitive architecture for artificial intelligence      \033[36m║
+    ║\033[0m\033[90m   identity · routing · memory · habits · metabolism       \033[36m║
+    ║                                                              ║
+    ╚══════════════════════════════════════════════════════════════╝\033[0m
+""")
+    print(f"\033[33m  vessel: {vessel_name}\033[0m")
+    print(f"\033[90m  provider: {LLM_PROVIDER} | model: {BRIDGE_MODEL}\033[0m")
+    print(f"\033[90m  vault: {len(list(VAULT_DIR.rglob('*.md')))} notes | habits: {len(load_habits().get('routes', {}))} routes\033[0m")
+    print(f"\033[90m  ─────────────────────────────────────────────────────\033[0m")
+    print(f"\033[90m  type 'exit' to quit | 'clear' to reset session\033[0m")
+    print(f"\033[90m  ─────────────────────────────────────────────────────\033[0m\n")
+
+    session_id = str(uuid.uuid4())[:8]
+    history = []
+
+    while True:
+        try:
+            user_input = input(f"\033[36m  you:\033[0m ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n")
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() == "exit":
+            break
+        if user_input.lower() == "clear":
+            history.clear()
+            if session_id in _chat_sessions:
+                del _chat_sessions[session_id]
+            print(f"\033[90m  session cleared.\033[0m\n")
+            continue
+
+        history.append({"role": "user", "content": user_input})
+        _chat_sessions[session_id] = history
+
+        try:
+            ctx = load_vessel()
+            route = hecate(ctx, user_input)
+            tree_context = build_tree_context(route)
+            system = _build_chat_system(ctx["vessel"], ctx["state"] or "(no prior state)", tree_context)
+
+            # Show routing info
+            nodes = route.get("nodes", [])
+            habit_used = route.get("_habit", False)
+            if habit_used:
+                print(f"\033[90m  hecate: habit → {' → '.join(nodes)}\033[0m")
+            else:
+                print(f"\033[90m  hecate: {' → '.join(nodes)}\033[0m")
+
+            # Run the operator loop
+            result = await _operator_loop(session_id, history, system)
+
+            if result["done"]:
+                reply = result["reply"]
+                # Record habit
+                try:
+                    habits = load_habits()
+                    record_success(habits, _make_task_key(user_input),
+                                   _extract_signature(user_input), nodes)
+                except Exception:
+                    pass
+
+                # Summarize if needed
+                if len(history) >= CHAT_HISTORY_MAX:
+                    history = await _summarize_and_compress(session_id, history, ctx["vessel"])
+                    _chat_sessions[session_id] = history
+                _save_chat_history(session_id, history)
+
+                # Print reply
+                print()
+                for line in reply.split("\n"):
+                    print(f"\033[33m  {vessel_name}:\033[0m {line}" if line == reply.split("\n")[0] else f"         {line}")
+                print()
+
+            else:
+                # Dangerous tools need confirmation
+                pending = result.get("pending", [])
+                vessel_text = result.get("vessel_text", "")
+                if vessel_text:
+                    print(f"\n\033[33m  {vessel_name}:\033[0m {vessel_text}\n")
+
+                for i, action in enumerate(pending):
+                    atype = action.get("type", "?")
+                    desc = action.get("description", "")
+                    path = action.get("path", "")
+                    cmd = action.get("command", "")
+                    print(f"\033[91m  [{i+1}] {atype}\033[0m", end="")
+                    if path:
+                        print(f" → {path}", end="")
+                    if cmd:
+                        print(f" → {cmd}", end="")
+                    if desc:
+                        print(f"\n\033[90m      {desc}\033[0m", end="")
+                    print()
+
+                try:
+                    confirm = input(f"\n\033[36m  confirm? (y/n):\033[0m ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    confirm = "n"
+
+                confirmed = confirm in ("y", "yes")
+
+                # Execute the pending actions
+                pending_data = _chat_pending.pop(session_id, None)
+                if pending_data:
+                    tool_results = pending_data["safe_results"]
+                    for tc in pending_data["dangerous_calls"]:
+                        if confirmed:
+                            res = _exec_dangerous_tool(tc["name"], tc["input"])
+                            print(f"\033[32m  ✓ {tc['name']}: {res[:80]}\033[0m")
+                        else:
+                            res = "Operator cancelled."
+                            print(f"\033[90m  ✗ cancelled\033[0m")
+                        tool_results.append({"type": "tool_result", "tool_use_id": tc["id"], "content": res})
+
+                    history.append({"role": "user", "content": tool_results})
+                    _trim_history(history)
+
+                    # Continue the loop after confirmation
+                    result2 = await _operator_loop(session_id, history, pending_data["system"])
+                    if result2["done"]:
+                        reply = result2["reply"]
+                        _save_chat_history(session_id, history)
+                        print()
+                        for line in reply.split("\n"):
+                            print(f"\033[33m  {vessel_name}:\033[0m {line}" if line == reply.split("\n")[0] else f"         {line}")
+                        print()
+
+        except Exception as e:
+            print(f"\033[91m  error: {type(e).__name__}: {e}\033[0m\n")
+            if history and history[-1].get("role") == "user":
+                history.pop()
+
+    # Commit to vault on exit
+    print(f"\033[90m  committing session to vault...\033[0m")
+    if history and len(history) >= 2:
+        convo_lines = []
+        for msg in history[-20:]:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+            convo_lines.append(f"{msg.get('role', '?')}: {str(content)[:300]}")
+        convo_text = "\n".join(convo_lines)
+        hrr = HolographicMemory(path=str(VAULT_DIR / "hrr_memory.json"))
+        novelty = hrr.novelty(convo_text)
+        if novelty >= 0.4:
+            try:
+                resp = client.messages.create(
+                    model=BRIDGE_MODEL_FAST, max_tokens=400,
+                    messages=[{"role": "user", "content":
+                        f"Summarize this conversation into a vault note. "
+                        f"Key decisions, topics, action items. Use [[wikilinks]]. Under 200 words.\n\n{convo_text}"}],
+                    timeout=60,
+                )
+                note_content = _get_text(resp)
+            except Exception:
+                note_content = convo_text[:500]
+
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
+            note_path = VAULT_DIR / "sessions" / f"{vessel_name}_{ts}.md"
+            note_path.parent.mkdir(parents=True, exist_ok=True)
+            note_path.write_text(
+                f"---\ntags: [session, {vessel_name.lower()}]\nvessel: {vessel_name}\n"
+                f"date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\nnovelty: {novelty:.2f}\n---\n\n"
+                f"# Session with {vessel_name}\n\n{note_content}"
+            )
+            hrr.bind(f"session_{session_id}", convo_text[:500], metadata={"vessel": vessel_name})
+            print(f"\033[32m  ✓ saved to vault (novelty: {novelty:.2f})\033[0m")
+        else:
+            print(f"\033[90m  skipped (novelty: {novelty:.2f} — already known)\033[0m")
+
+    print(f"\033[90m  goodbye.\033[0m\n")
+
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# SECTION 13: TELEGRAM MODE
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_ALLOWED_IDS = os.environ.get("TELEGRAM_ALLOWED_IDS", "")  # comma-separated
+
+
+def _tg_allowed(user_id: int) -> bool:
+    """Check if user is allowed (empty = anyone)."""
+    if not TELEGRAM_ALLOWED_IDS.strip():
+        return True
+    allowed = [int(x.strip()) for x in TELEGRAM_ALLOWED_IDS.split(",") if x.strip()]
+    return user_id in allowed
+
+
+async def _telegram_run():
+    """Run the bridge as a Telegram bot."""
+    from telegram import Update
+    from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+    _init_dirs()
+    _init_vault()
+    _generate_default_tree()
+    _load_plugins()
+
+    ctx = load_vessel()
+    vessel_name = "VESSEL"
+    for line in ctx["vessel"].split("\n"):
+        if line.startswith("# "):
+            vessel_name = line[2:].strip()
+            break
+
+    log.info(f"TELEGRAM: starting as @{vessel_name}")
+
+    # Per-user session tracking
+    _tg_sessions: dict[int, list] = {}
+
+    async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if not _tg_allowed(uid):
+            await update.message.reply_text("Not authorized.")
+            return
+        _tg_sessions[uid] = []
+        vault_count = len(list(VAULT_DIR.rglob("*.md"))) if VAULT_DIR.exists() else 0
+        habits_count = len(load_habits().get("routes", {}))
+        await update.message.reply_text(
+            f"◆ {vessel_name}\n"
+            f"  vault: {vault_count} notes | habits: {habits_count} routes\n\n"
+            f"Send me anything. /clear to reset. /status for diagnostics."
+        )
+
+    async def _handle_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if not _tg_allowed(uid):
+            return
+        _tg_sessions[uid] = []
+        sid = f"tg_{uid}"
+        if sid in _chat_sessions:
+            del _chat_sessions[sid]
+        await update.message.reply_text("Session cleared.")
+
+    async def _handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if not _tg_allowed(uid):
+            return
+        vctx = load_vessel()
+        vault_count = len(list(VAULT_DIR.rglob("*.md"))) if VAULT_DIR.exists() else 0
+        habits = load_habits()
+        routes_count = len(habits.get("routes", {}))
+        await update.message.reply_text(
+            f"◆ {vessel_name}\n"
+            f"  provider: {LLM_PROVIDER} | model: {BRIDGE_MODEL}\n"
+            f"  vault: {vault_count} notes\n"
+            f"  habits: {routes_count} routes\n"
+            f"  state: {len(vctx.get('state', '') or '')} chars"
+        )
+
+    async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if not _tg_allowed(uid):
+            await update.message.reply_text("Not authorized.")
+            return
+
+        user_text = update.message.text
+        if not user_text:
+            return
+
+        session_id = f"tg_{uid}"
+        history = _tg_sessions.get(uid, [])
+        history.append({"role": "user", "content": user_text})
+        _tg_sessions[uid] = history
+        _chat_sessions[session_id] = history
+
+        try:
+            vctx = load_vessel()
+            route = hecate(vctx, user_text)
+            tree_context = build_tree_context(route)
+            system = _build_chat_system(
+                vctx["vessel"],
+                vctx["state"] or "(no prior state)",
+                tree_context
+            )
+
+            # Override the system prompt ending for telegram context
+            system = system.replace(
+                "You are in a direct terminal conversation with your operator.",
+                "You are in a Telegram conversation. Keep responses concise — "
+                "under 4000 chars. Use plain text, no ANSI codes. Be direct."
+            )
+
+            result = await _operator_loop(session_id, history, system)
+
+            if result["done"]:
+                reply = result["reply"]
+
+                # Record habit success
+                try:
+                    habits = load_habits()
+                    nodes = route.get("nodes", [])
+                    record_success(habits, _make_task_key(user_text),
+                                   _extract_signature(user_text), nodes)
+                except Exception:
+                    pass
+
+                # Trim if needed
+                if len(history) >= CHAT_HISTORY_MAX:
+                    history = await _summarize_and_compress(session_id, history, vctx["vessel"])
+                    _tg_sessions[uid] = history
+                    _chat_sessions[session_id] = history
+                _save_chat_history(session_id, history)
+
+                # Telegram max message is 4096 chars
+                if len(reply) > 4000:
+                    for i in range(0, len(reply), 4000):
+                        await update.message.reply_text(reply[i:i+4000])
+                else:
+                    await update.message.reply_text(reply)
+
+            else:
+                # Dangerous tools — auto-deny in telegram for safety
+                vessel_text = result.get("vessel_text", "")
+                pending = result.get("pending", [])
+                denied_names = [a.get("type", "?") for a in pending]
+                msg = vessel_text or "I want to run some tools but they need confirmation."
+                msg += f"\n\n⚠️ Blocked tools (telegram safety): {', '.join(denied_names)}"
+                msg += "\nUse the terminal or web interface for operations that modify files."
+                await update.message.reply_text(msg)
+
+                # Cancel the pending actions
+                pending_data = _chat_pending.pop(session_id, None)
+                if pending_data:
+                    tool_results = pending_data["safe_results"]
+                    for tc in pending_data["dangerous_calls"]:
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tc["id"],
+                            "content": "Operator denied (telegram safety mode)."
+                        })
+                    history.append({"role": "user", "content": tool_results})
+                    result2 = await _operator_loop(session_id, history, pending_data["system"])
+                    if result2["done"]:
+                        reply = result2["reply"]
+                        if len(reply) > 4000:
+                            for i in range(0, len(reply), 4000):
+                                await update.message.reply_text(reply[i:i+4000])
+                        else:
+                            await update.message.reply_text(reply)
+
+        except Exception as e:
+            log.error(f"TELEGRAM error: {e}")
+            await update.message.reply_text(f"Error: {type(e).__name__}: {str(e)[:200]}")
+            if history and history[-1].get("role") == "user":
+                history.pop()
+
+        # Vault commit — every 10 messages, check novelty and save
+        if len(history) >= 10 and len(history) % 10 == 0:
+            try:
+                convo_lines = []
+                for msg in history[-20:]:
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+                    convo_lines.append(f"{msg.get('role', '?')}: {str(content)[:300]}")
+                convo_text = "\n".join(convo_lines)
+                hrr = HolographicMemory(path=str(VAULT_DIR / "hrr_memory.json"))
+                novelty = hrr.novelty(convo_text)
+                if novelty >= 0.4:
+                    resp = client.messages.create(
+                        model=BRIDGE_MODEL_FAST, max_tokens=400,
+                        messages=[{"role": "user", "content":
+                            f"Summarize this Telegram conversation into a vault note. "
+                            f"Key decisions, topics, action items. Use [[wikilinks]]. Under 200 words.\n\n{convo_text}"}],
+                        timeout=60,
+                    )
+                    note_content = _get_text(resp)
+                    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
+                    note_path = VAULT_DIR / "sessions" / f"tg_{vessel_name}_{ts}.md"
+                    note_path.parent.mkdir(parents=True, exist_ok=True)
+                    note_path.write_text(
+                        f"---\ntags: [session, telegram, {vessel_name.lower()}]\n"
+                        f"vessel: {vessel_name}\nuser: {uid}\n"
+                        f"date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n"
+                        f"novelty: {novelty:.2f}\n---\n\n"
+                        f"# Telegram Session\n\n{note_content}"
+                    )
+                    hrr.bind(f"tg_{session_id}_{len(history)}", convo_text[:500],
+                             metadata={"vessel": vessel_name, "channel": "telegram"})
+                    log.info(f"TELEGRAM: vault commit for user {uid} (novelty: {novelty:.2f})")
+            except Exception as e:
+                log.warning(f"TELEGRAM vault commit failed: {e}")
+
+    # Build the bot
+    app_tg = Application.builder().token(TELEGRAM_TOKEN).build()
+    app_tg.add_handler(CommandHandler("start", _handle_start))
+    app_tg.add_handler(CommandHandler("clear", _handle_clear))
+    app_tg.add_handler(CommandHandler("status", _handle_status))
+    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
+
+    # Start background tasks
+    loop = asyncio.get_event_loop()
+    loop.create_task(_heartbeat_loop())
+    loop.create_task(_substrate_loop())
+
+    log.info(f"TELEGRAM: {vessel_name} is live. Polling...")
+    await app_tg.initialize()
+    await app_tg.start()
+    await app_tg.updater.start_polling()
+
+    # Keep alive
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, SystemExit):
+        await app_tg.updater.stop()
+        await app_tg.stop()
+        await app_tg.shutdown()
+
+
+if __name__ == "__main__":
+    mode = "cli"
+    if "--serve" in sys.argv:
+        mode = "serve"
+    elif "--telegram" in sys.argv:
+        mode = "telegram"
+
+    if mode == "serve":
+        # HTTP server mode
+        if not (VESSEL_DIR / "VESSEL.md").exists() and sys.stdin.isatty():
+            _init_dirs()
+            _auto_init_tty()
+            _generate_default_tree()
+            _init_vault()
+        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    elif mode == "telegram":
+        if not TELEGRAM_TOKEN:
+            print("\033[91m  error: TELEGRAM_BOT_TOKEN not set in .env\033[0m")
+            print("\033[90m  1. Message @BotFather on Telegram\033[0m")
+            print("\033[90m  2. /newbot → pick a name → get token\033[0m")
+            print("\033[90m  3. Add to .env: TELEGRAM_BOT_TOKEN=your_token\033[0m")
+            print("\033[90m  4. Optional: TELEGRAM_ALLOWED_IDS=12345,67890\033[0m")
+            sys.exit(1)
+        asyncio.run(_telegram_run())
+    else:
+        # Terminal REPL mode (default)
+        asyncio.run(_cli_loop())
