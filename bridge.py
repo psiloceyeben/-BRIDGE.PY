@@ -82,9 +82,9 @@ except (ValueError, TypeError):
     HEARTBEAT_INTERVAL = 1800
 
 try:
-    SUBSTRATE_INTERVAL = int(os.environ.get("SUBSTRATE_INTERVAL", "300"))
+    SUBSTRATE_INTERVAL = int(os.environ.get("SUBSTRATE_INTERVAL", "150"))
 except (ValueError, TypeError):
-    SUBSTRATE_INTERVAL = 300
+    SUBSTRATE_INTERVAL = 150
 
 ALL_NODES = [
     "KETER", "CHOKMAH", "BINAH", "CHESED", "GEVURAH",
@@ -903,6 +903,11 @@ _plugin_tools = []
 def _load_plugins():
     """Scan tools/*.py for plugin tools. Each exports TOOL_DEFINITION, SAFE, execute(inp)."""
     global _plugin_tools
+    # Remove previously loaded plugins from OPERATOR_TOOLS to avoid duplicates
+    existing_plugin_names = {p["definition"]["name"] for p in _plugin_tools}
+    for i in range(len(OPERATOR_TOOLS) - 1, -1, -1):
+        if OPERATOR_TOOLS[i]["name"] in existing_plugin_names:
+            OPERATOR_TOOLS.pop(i)
     _plugin_tools = []
     if not TOOLS_DIR.exists():
         return
@@ -916,7 +921,8 @@ def _load_plugins():
                 defn = mod.TOOL_DEFINITION
                 is_safe = getattr(mod, "SAFE", False)
                 _plugin_tools.append({"definition": defn, "execute": mod.execute, "safe": is_safe})
-                OPERATOR_TOOLS.append(defn)
+                if defn["name"] not in {t["name"] for t in OPERATOR_TOOLS}:
+                    OPERATOR_TOOLS.append(defn)
                 if is_safe:
                     SAFE_TOOLS.add(defn["name"])
                 else:
@@ -1048,7 +1054,15 @@ def _exec_dangerous_tool(name: str, inp: dict) -> str:
                 return "Access denied"
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(inp["content"])
-            log.info(f"VAULT wrote {len(inp['content'])} chars → {inp['path']}")
+            # Bind to HRR so substrate can transform it
+            try:
+                hrr = HolographicMemory(path=str(VAULT_DIR / "hrr_memory.json"))
+                hrr.bind(f"vault_{inp['path']}", inp['content'][:500],
+                         metadata={"type": "vault_write", "path": inp["path"]})
+                log.info(f"VAULT wrote + HRR bound {len(inp['content'])} chars → {inp['path']}")
+            except Exception as e:
+                log.warning(f"VAULT wrote but HRR bind failed: {e}")
+                log.info(f"VAULT wrote {len(inp['content'])} chars → {inp['path']}")
             return f"Saved: {inp['path']} ({len(inp['content'])} chars)"
 
         for plugin in _plugin_tools:
@@ -1745,17 +1759,40 @@ def _auto_init_tty():
     print()
     limits = input("\033[36m  ◆ What should it never do or say?\033[0m\n  > ").strip()
 
-    lines = [f"# {name}", ""]
+    VESSEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Base vessel knows what it's running on — operator answers get layered on top
+    body_knowledge = (
+        "## What This Is\n"
+        "You are running on bridge.py — a cognitive architecture that gives you a body. You have:\n"
+        "- **Identity** (this file) — who you are\n"
+        "- **Routing** (Tree of Life) — every request passes through sephiroth classification via Hecate\n"
+        "- **Habits** (Yesod) — procedural memory that learns from use. Proven routes skip classification.\n"
+        "- **Memory** (HRR) — holographic reduced representations. Sub-millisecond recall, zero API cost.\n"
+        "- **Vault** (Obsidian) — your declarative memory. Novel conversations are committed as markdown with wikilinks.\n"
+        "- **Metabolism** (Substrate) — continuous background transformations on memory vectors between conversations.\n"
+        "- **Tools** — plugin tools auto-discovered from tools/. You can create PDFs, read/write files, search the vault, run commands.\n"
+        "\n"
+        "You know what you are. Your vault is your experience. Your habits are your learned behavior. "
+        "Your substrate runs even when no one is talking to you.\n"
+    )
+
+    lines = [f"# {name}", "", body_knowledge]
     if purpose:
         lines += ["## Purpose", purpose, ""]
     if voice:
         lines += ["## Voice", voice, ""]
+    else:
+        lines += ["## Voice", "Curious, direct, present.", ""]
     if knowledge:
         lines += ["## Knowledge", knowledge, ""]
+    else:
+        lines += ["## Knowledge", "Everything in the vault, everything in habits, everything the substrate has consolidated.", ""]
     if limits:
         lines += ["## Limits", limits, ""]
+    else:
+        lines += ["## Limits", "Honest about uncertainty. Tools that modify files require operator confirmation in terminal mode.", ""]
 
-    VESSEL_DIR.mkdir(parents=True, exist_ok=True)
     (VESSEL_DIR / "VESSEL.md").write_text("\n".join(lines) + "\n")
     (VESSEL_DIR / "STATE.md").write_text("# STATE\n\nFirst run. No history yet.\n")
 
@@ -1868,18 +1905,34 @@ async def serve_static(path: str):
 
 class Substrate:
     """
-    Continuous background process that transforms HRR memory vectors.
-    Pure numpy — zero API cost. The vessel's unconscious.
+    Continuous background metabolism. Pure numpy — zero API cost.
+
+    Each interval runs ONE phase in rotation:
+      1. Hebbian decay — strengthen recalled, weaken forgotten
+      2. Resonance — boost frequently accessed bindings
+      3. Spectral consolidation — FFT denoise
+      4. Metabolize — digest oldest binding into composite memory, delete from index
+
+    The index is short-term memory. The composite vector is long-term memory.
+    Metabolism converts one into the other. Like a snake: consume, digest,
+    the nutrition becomes part of the body, the entry is shed.
+
+    After MAX_BINDINGS, every metabolize cycle digests the oldest.
+    The memory stays fixed-size. Old experience becomes structure.
     """
+
+    MAX_BINDINGS = 200   # above this, oldest get fully absorbed and removed
+    SOFT_CAP = 100       # above this, oldest cold bindings get weight-reduced
 
     def __init__(self, hrr: HolographicMemory):
         self.hrr = hrr
         self.cycle_count = 0
+        self.phases = ["hebbian", "resonance", "spectral", "metabolize"]
 
     def _hebbian_decay(self):
         """Decay unused associations, strengthen frequently recalled ones."""
         if np.linalg.norm(self.hrr.memory) < 1e-10:
-            return
+            return "skip:empty"
         hot_keys = {f["key"] for f in self.hrr.get_hot_facts(threshold=2)}
         new_memory = np.zeros(self.hrr.dim, dtype=complex)
         for entry in self.hrr.index:
@@ -1889,48 +1942,124 @@ class Substrate:
             factor = 1.02 if entry["key"] in hot_keys else 0.98
             new_memory += binding * factor
         self.hrr.memory = new_memory
+        return f"decay applied ({len(hot_keys)} hot)"
 
     def _resonance_amplify(self):
         """Boost facts recalled 3+ times."""
+        boosted = 0
         for entry in self.hrr.index:
             if self.hrr.recall_counts.get(entry["key"], 0) >= 3:
                 kv = _seed_vector(entry["key"], self.hrr.dim)
                 vv = _seed_vector(entry["value"], self.hrr.dim)
                 self.hrr.memory += _circular_conv(kv, vv) * 0.05
+                boosted += 1
+        return f"resonance ({boosted} boosted)"
 
     def _spectral_consolidate(self):
         """FFT denoise: suppress weak frequency bins."""
         if np.linalg.norm(self.hrr.memory) < 1e-10:
-            return
+            return "skip:empty"
         spectrum = np.fft.fft(self.hrr.memory)
         threshold = np.percentile(np.abs(spectrum), 10)
+        suppressed = int(np.sum(np.abs(spectrum) <= threshold))
         spectrum *= (np.abs(spectrum) > threshold)
         self.hrr.memory = np.fft.ifft(spectrum)
+        return f"spectral ({suppressed} bins suppressed)"
+
+    def _metabolize(self):
+        """
+        Re-evaluate and re-weight bindings. Not deletion — weight shifting.
+
+        The composite memory is rebuilt each metabolize cycle with adjusted weights:
+        - Hot bindings (recalled often): weight UP
+        - Cold bindings (never recalled): weight DOWN over time
+        - Very old + very cold: eventually absorbed and removed (hard cap only)
+
+        This keeps complexity high but prevents bloat.
+        """
+        n = len(self.hrr.index)
+        if n < 2:
+            return "skip:too few"
+
+        # Hard cap — actually remove the oldest cold entries
+        removed = 0
+        while len(self.hrr.index) > self.MAX_BINDINGS:
+            oldest = self.hrr.index[0]
+            # Absorb into composite before removing
+            kv = _seed_vector(oldest["key"], self.hrr.dim)
+            vv = _seed_vector(oldest["value"], self.hrr.dim)
+            self.hrr.memory += _circular_conv(kv, vv) * 0.5  # half-strength absorption
+            self.hrr.index.pop(0)
+            self.hrr.recall_counts.pop(oldest["key"], None)
+            removed += 1
+
+        # Soft re-weighting — rebuild composite with position-aware weights
+        # Newer bindings get more weight, cold bindings get less
+        new_memory = np.zeros(self.hrr.dim, dtype=complex)
+        reweighted = 0
+        for i, entry in enumerate(self.hrr.index):
+            kv = _seed_vector(entry["key"], self.hrr.dim)
+            vv = _seed_vector(entry["value"], self.hrr.dim)
+            binding = _circular_conv(kv, vv)
+
+            recalls = self.hrr.recall_counts.get(entry["key"], 0)
+            age_factor = (i + 1) / len(self.hrr.index)  # 0→1, older=lower
+
+            # Weight: base 0.5 + recency bonus + recall bonus
+            weight = 0.5 + (age_factor * 0.3) + (min(recalls, 5) * 0.04)
+            new_memory += binding * weight
+            reweighted += 1
+
+        self.hrr.memory = new_memory
+
+        detail = f"reweighted {reweighted} bindings"
+        if removed:
+            detail += f", removed {removed} (over hard cap)"
+        return detail
 
     def transform(self) -> dict:
-        """Run one substrate cycle."""
+        """Run one phase of the metabolism cycle."""
         self.cycle_count += 1
+        phase_idx = (self.cycle_count - 1) % len(self.phases)
+        phase = self.phases[phase_idx]
+
         norm_before = float(np.linalg.norm(self.hrr.memory))
-        self._hebbian_decay()
-        self._resonance_amplify()
-        self._spectral_consolidate()
+
+        if phase == "hebbian":
+            detail = self._hebbian_decay()
+        elif phase == "resonance":
+            detail = self._resonance_amplify()
+        elif phase == "spectral":
+            detail = self._spectral_consolidate()
+        elif phase == "metabolize":
+            detail = self._metabolize()
+        else:
+            detail = "unknown phase"
+
         norm_after = float(np.linalg.norm(self.hrr.memory))
         self.hrr._save()
         delta = abs(norm_after - norm_before)
 
-        if delta > 0.1:
-            log.info(f"SUBSTRATE cycle {self.cycle_count}: {norm_before:.2f} → {norm_after:.2f} (Δ{delta:.2f})")
+        log.info(
+            f"SUBSTRATE #{self.cycle_count} [{phase}]: "
+            f"norm {norm_before:.2f} → {norm_after:.2f} (Δ{delta:.4f}) | "
+            f"{len(self.hrr.index)} bindings | {detail}"
+        )
+
+        # Log significant transformations to vault
         if delta > 1.0 and VAULT_DIR.exists():
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
             (VAULT_DIR / "knowledge").mkdir(parents=True, exist_ok=True)
             (VAULT_DIR / "knowledge" / f"substrate_{ts}.md").write_text(
                 f"---\ntags: [substrate, metabolism]\ndate: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n---\n\n"
-                f"# Substrate — Cycle {self.cycle_count}\n\n"
+                f"# Substrate — Cycle {self.cycle_count} ({phase})\n\n"
                 f"Norm: {norm_before:.2f} → {norm_after:.2f} (Δ{delta:.2f})\n"
-                f"Hot facts: {len(self.hrr.get_hot_facts())}. Total: {len(self.hrr.index)}.\n"
+                f"Bindings: {len(self.hrr.index)}. Hot: {len(self.hrr.get_hot_facts())}.\n"
+                f"Detail: {detail}\n"
             )
 
-        return {"cycle": self.cycle_count, "norm_before": norm_before, "norm_after": norm_after, "delta": delta}
+        return {"cycle": self.cycle_count, "phase": phase, "norm_before": norm_before,
+                "norm_after": norm_after, "delta": delta, "detail": detail}
 
 
 # ╔════════════════════════════════════════════════════════════════════════════╗
@@ -2009,7 +2138,7 @@ async def _substrate_loop():
 
 @app.on_event("startup")
 async def startup():
-    """Initialize everything and start background loops."""
+    """Initialize everything and start background loops + Telegram if token exists."""
     _init_dirs()
     _init_vault()
     _generate_default_tree()
@@ -2019,6 +2148,19 @@ async def startup():
         asyncio.create_task(_heartbeat_loop())
         asyncio.create_task(_substrate_loop())
         log.info("BRIDGE started: " + read(VESSEL_DIR / "VESSEL.md").split("\n")[0])
+
+        # Auto-start Telegram bot if token is configured
+        if TELEGRAM_TOKEN:
+            async def _tg_bg():
+                try:
+                    app_tg, vessel_name = await _telegram_run()
+                    await app_tg.initialize()
+                    await app_tg.start()
+                    await app_tg.updater.start_polling()
+                    log.info(f"TELEGRAM: {vessel_name} is live (inside --serve)")
+                except Exception as e:
+                    log.error(f"TELEGRAM failed to start: {e}")
+            asyncio.create_task(_tg_bg())
     else:
         log.info("BRIDGE started — no vessel. Visit /setup to create one.")
 
@@ -2311,6 +2453,48 @@ async def _telegram_run():
     # Per-user session tracking
     _tg_sessions: dict[int, list] = {}
 
+    async def _tg_send_reply(update: Update, reply: str, vessel_name: str):
+        """Send reply, plus any files created during the exchange."""
+        # Check if any files were recently created in vault or base dir
+        import glob as _glob
+        recent_files = []
+        for pattern in [
+            str(VAULT_DIR / "**" / "*.pdf"),
+            str(VAULT_DIR / "**" / "*.md"),
+            str(BASE_DIR / "*.pdf"),
+            str(BASE_DIR / "*.md"),
+            str(BASE_DIR / "output" / "*"),
+            str(VAULT_DIR / "**" / "*.docx"),
+            str(BASE_DIR / "*.docx"),
+        ]:
+            for fp in _glob.glob(pattern, recursive=True):
+                p = Path(fp)
+                if p.name == "INDEX.md":
+                    continue
+                age = (datetime.now(timezone.utc) - datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)).total_seconds()
+                if age < 120:  # created in the last 2 minutes
+                    recent_files.append(p)
+
+        # Send text reply
+        if reply:
+            if len(reply) > 4000:
+                for i in range(0, len(reply), 4000):
+                    await update.message.reply_text(reply[i:i+4000])
+            else:
+                await update.message.reply_text(reply)
+
+        # Send any recently created files
+        for fpath in recent_files:
+            try:
+                with open(fpath, "rb") as f:
+                    await update.message.reply_document(
+                        document=f,
+                        filename=fpath.name,
+                        caption=f"📄 {fpath.name}"
+                    )
+            except Exception as e:
+                log.warning(f"TELEGRAM: failed to send file {fpath}: {e}")
+
     async def _handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
         if not _tg_allowed(uid):
@@ -2380,8 +2564,14 @@ async def _telegram_run():
             # Override the system prompt ending for telegram context
             system = system.replace(
                 "You are in a direct terminal conversation with your operator.",
-                "You are in a Telegram conversation. Keep responses concise — "
-                "under 4000 chars. Use plain text, no ANSI codes. Be direct."
+                "You are in a Telegram conversation with your operator. "
+                "You have FULL tool access — read files, write files, run commands. "
+                "All tools are auto-approved. "
+                "IMPORTANT: When asked to create a PDF, paper, report, or document, "
+                "ALWAYS use the create_pdf tool. Read the source content first with vault_read, "
+                "then call create_pdf with the full content. The PDF will be auto-sent to Telegram. "
+                "Write the FULL content — never truncate, never summarize, never abbreviate. "
+                "Long messages will be split automatically. Use plain text, no ANSI codes. Be direct and thorough."
             )
 
             result = await _operator_loop(session_id, history, system)
@@ -2405,42 +2595,32 @@ async def _telegram_run():
                     _chat_sessions[session_id] = history
                 _save_chat_history(session_id, history)
 
-                # Telegram max message is 4096 chars
-                if len(reply) > 4000:
-                    for i in range(0, len(reply), 4000):
-                        await update.message.reply_text(reply[i:i+4000])
-                else:
-                    await update.message.reply_text(reply)
+                await _tg_send_reply(update, reply, vessel_name)
 
             else:
-                # Dangerous tools — auto-deny in telegram for safety
+                # Dangerous tools — auto-approve in Telegram (operator is messaging directly)
                 vessel_text = result.get("vessel_text", "")
                 pending = result.get("pending", [])
-                denied_names = [a.get("type", "?") for a in pending]
-                msg = vessel_text or "I want to run some tools but they need confirmation."
-                msg += f"\n\n⚠️ Blocked tools (telegram safety): {', '.join(denied_names)}"
-                msg += "\nUse the terminal or web interface for operations that modify files."
-                await update.message.reply_text(msg)
+                action_names = [a.get("type", "?") for a in pending]
+                if vessel_text:
+                    await update.message.reply_text(vessel_text)
 
-                # Cancel the pending actions
+                # Execute all pending actions
                 pending_data = _chat_pending.pop(session_id, None)
                 if pending_data:
                     tool_results = pending_data["safe_results"]
                     for tc in pending_data["dangerous_calls"]:
+                        res = _exec_dangerous_tool(tc["name"], tc["input"])
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": tc["id"],
-                            "content": "Operator denied (telegram safety mode)."
+                            "content": res
                         })
                     history.append({"role": "user", "content": tool_results})
                     result2 = await _operator_loop(session_id, history, pending_data["system"])
                     if result2["done"]:
                         reply = result2["reply"]
-                        if len(reply) > 4000:
-                            for i in range(0, len(reply), 4000):
-                                await update.message.reply_text(reply[i:i+4000])
-                        else:
-                            await update.message.reply_text(reply)
+                        await _tg_send_reply(update, reply, vessel_name)
 
         except Exception as e:
             log.error(f"TELEGRAM error: {e}")
@@ -2449,7 +2629,7 @@ async def _telegram_run():
                 history.pop()
 
         # Vault commit — every 10 messages, check novelty and save
-        if len(history) >= 10 and len(history) % 10 == 0:
+        if len(history) >= 4 and len(history) % 4 == 0:
             try:
                 convo_lines = []
                 for msg in history[-20:]:
@@ -2492,7 +2672,13 @@ async def _telegram_run():
     app_tg.add_handler(CommandHandler("status", _handle_status))
     app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
 
-    # Start background tasks
+    return app_tg, vessel_name
+
+
+async def _start_telegram_standalone():
+    """Run telegram as standalone (no HTTP)."""
+    app_tg, vessel_name = await _telegram_run()
+
     loop = asyncio.get_event_loop()
     loop.create_task(_heartbeat_loop())
     loop.create_task(_substrate_loop())
@@ -2502,7 +2688,6 @@ async def _telegram_run():
     await app_tg.start()
     await app_tg.updater.start_polling()
 
-    # Keep alive
     try:
         while True:
             await asyncio.sleep(3600)
@@ -2520,14 +2705,17 @@ if __name__ == "__main__":
         mode = "telegram"
 
     if mode == "serve":
-        # HTTP server mode
+        # HTTP + Telegram (auto-starts Telegram if token exists in .env)
         if not (VESSEL_DIR / "VESSEL.md").exists() and sys.stdin.isatty():
             _init_dirs()
             _auto_init_tty()
             _generate_default_tree()
             _init_vault()
+        if TELEGRAM_TOKEN:
+            log.info("TELEGRAM token found — bot will start alongside HTTP server")
         uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
     elif mode == "telegram":
+        # Telegram only (no HTTP server)
         if not TELEGRAM_TOKEN:
             print("\033[91m  error: TELEGRAM_BOT_TOKEN not set in .env\033[0m")
             print("\033[90m  1. Message @BotFather on Telegram\033[0m")
@@ -2535,7 +2723,7 @@ if __name__ == "__main__":
             print("\033[90m  3. Add to .env: TELEGRAM_BOT_TOKEN=your_token\033[0m")
             print("\033[90m  4. Optional: TELEGRAM_ALLOWED_IDS=12345,67890\033[0m")
             sys.exit(1)
-        asyncio.run(_telegram_run())
+        asyncio.run(_start_telegram_standalone())
     else:
         # Terminal REPL mode (default)
         asyncio.run(_cli_loop())
