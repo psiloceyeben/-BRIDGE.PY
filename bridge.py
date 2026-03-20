@@ -81,7 +81,10 @@ try:
 except (ValueError, TypeError):
     HEARTBEAT_INTERVAL = 1800
 
-SUBSTRATE_INTERVAL = int(os.environ.get("SUBSTRATE_INTERVAL", "300"))
+try:
+    SUBSTRATE_INTERVAL = int(os.environ.get("SUBSTRATE_INTERVAL", "300"))
+except (ValueError, TypeError):
+    SUBSTRATE_INTERVAL = 300
 
 ALL_NODES = [
     "KETER", "CHOKMAH", "BINAH", "CHESED", "GEVURAH",
@@ -665,7 +668,7 @@ def _calc_confidence(habit: dict) -> float:
     recent_total = len(recent)
     if recent_total + old_total == 0:
         return 0.0
-    return (recent_s * 2 + old_s) / (recent_total * 2 + max(old_total, 1))
+    return min(1.0, (recent_s * 2 + old_s) / (recent_total * 2 + max(old_total, 1)))
 
 
 def _check_conditions(conditions: dict, context: dict) -> bool:
@@ -936,7 +939,7 @@ def _exec_safe_tool(name: str, inp: dict) -> str:
     try:
         if name == "read_file":
             p = _resolve_path(inp["path"])
-            if not str(p).startswith(str(SANDBOX_ROOT)):
+            if not (p == SANDBOX_ROOT or str(p).startswith(str(SANDBOX_ROOT) + os.sep)):
                 return "Access denied: path outside sandbox"
             if not p.exists():
                 return f"File not found: {inp['path']}"
@@ -945,7 +948,7 @@ def _exec_safe_tool(name: str, inp: dict) -> str:
 
         if name == "list_dir":
             p = _resolve_path(inp["path"])
-            if not str(p).startswith(str(SANDBOX_ROOT)):
+            if not (p == SANDBOX_ROOT or str(p).startswith(str(SANDBOX_ROOT) + os.sep)):
                 return "Access denied: path outside sandbox"
             if not p.exists():
                 return f"Not found: {inp['path']}"
@@ -1009,7 +1012,7 @@ def _exec_dangerous_tool(name: str, inp: dict) -> str:
     try:
         if name == "write_file":
             p = _resolve_path(inp["path"])
-            if not str(p).startswith(str(SANDBOX_ROOT)):
+            if not (p == SANDBOX_ROOT or str(p).startswith(str(SANDBOX_ROOT) + os.sep)):
                 return "Access denied"
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(inp["content"])
@@ -1017,7 +1020,7 @@ def _exec_dangerous_tool(name: str, inp: dict) -> str:
 
         if name == "edit_file":
             p = _resolve_path(inp["path"])
-            if not str(p).startswith(str(SANDBOX_ROOT)):
+            if not (p == SANDBOX_ROOT or str(p).startswith(str(SANDBOX_ROOT) + os.sep)):
                 return "Access denied"
             if not p.exists():
                 return f"File not found: {inp['path']}"
@@ -1319,10 +1322,11 @@ def _build_chat_system(vessel_text: str, state_text: str, tree_context: str) -> 
 # ╚════════════════════════════════════════════════════════════════════════════╝
 
 def check_token(request: Request) -> bool:
+    import hmac
     if not BUILD_TOKEN:
         return True
     provided = request.headers.get("X-Build-Token", "") or request.query_params.get("token", "")
-    return provided == BUILD_TOKEN
+    return hmac.compare_digest(provided, BUILD_TOKEN)
 
 
 @app.post("/chat")
@@ -2178,15 +2182,46 @@ async def _cli_loop():
                     history.append({"role": "user", "content": tool_results})
                     _trim_history(history)
 
-                    # Continue the loop after confirmation
-                    result2 = await _operator_loop(session_id, history, pending_data["system"])
-                    if result2["done"]:
-                        reply = result2["reply"]
-                        _save_chat_history(session_id, history)
-                        print()
-                        for line in reply.split("\n"):
-                            print(f"\033[33m  {vessel_name}:\033[0m {line}" if line == reply.split("\n")[0] else f"         {line}")
-                        print()
+                    # Continue the loop after confirmation — may need multiple rounds
+                    while True:
+                        result2 = await _operator_loop(session_id, history, pending_data["system"])
+                        if result2["done"]:
+                            reply = result2["reply"]
+                            _save_chat_history(session_id, history)
+                            print()
+                            for line in reply.split("\n"):
+                                print(f"\033[33m  {vessel_name}:\033[0m {line}" if line == reply.split("\n")[0] else f"         {line}")
+                            print()
+                            break
+                        else:
+                            # Another round of dangerous tools
+                            p2 = result2.get("pending", [])
+                            vt2 = result2.get("vessel_text", "")
+                            if vt2:
+                                print(f"\n\033[33m  {vessel_name}:\033[0m {vt2}\n")
+                            for j, a2 in enumerate(p2):
+                                print(f"\033[91m  [{j+1}] {a2.get('type','?')}\033[0m", end="")
+                                if a2.get("path"): print(f" → {a2['path']}", end="")
+                                if a2.get("command"): print(f" → {a2['command']}", end="")
+                                print()
+                            try:
+                                c2 = input(f"\n\033[36m  confirm? (y/n):\033[0m ").strip().lower()
+                            except (EOFError, KeyboardInterrupt):
+                                c2 = "n"
+                            pd2 = _chat_pending.pop(session_id, None)
+                            if pd2:
+                                tr2 = pd2["safe_results"]
+                                for tc2 in pd2["dangerous_calls"]:
+                                    if c2 in ("y", "yes"):
+                                        r2 = _exec_dangerous_tool(tc2["name"], tc2["input"])
+                                        print(f"\033[32m  ✓ {tc2['name']}: {r2[:80]}\033[0m")
+                                    else:
+                                        r2 = "Operator cancelled."
+                                    tr2.append({"type": "tool_result", "tool_use_id": tc2["id"], "content": r2})
+                                history.append({"role": "user", "content": tr2})
+                                _trim_history(history)
+                            else:
+                                break
 
         except Exception as e:
             print(f"\033[91m  error: {type(e).__name__}: {e}\033[0m\n")
@@ -2207,13 +2242,13 @@ async def _cli_loop():
         novelty = hrr.novelty(convo_text)
         if novelty >= 0.4:
             try:
-                resp = client.messages.create(
+                resp = await asyncio.to_thread(lambda: client.messages.create(
                     model=BRIDGE_MODEL_FAST, max_tokens=400,
                     messages=[{"role": "user", "content":
                         f"Summarize this conversation into a vault note. "
                         f"Key decisions, topics, action items. Use [[wikilinks]]. Under 200 words.\n\n{convo_text}"}],
                     timeout=60,
-                )
+                ))
                 note_content = _get_text(resp)
             except Exception:
                 note_content = convo_text[:500]
@@ -2246,7 +2281,11 @@ def _tg_allowed(user_id: int) -> bool:
     """Check if user is allowed (empty = anyone)."""
     if not TELEGRAM_ALLOWED_IDS.strip():
         return True
-    allowed = [int(x.strip()) for x in TELEGRAM_ALLOWED_IDS.split(",") if x.strip()]
+    try:
+        allowed = [int(x.strip()) for x in TELEGRAM_ALLOWED_IDS.split(",") if x.strip()]
+    except ValueError:
+        log.warning(f"TELEGRAM_ALLOWED_IDS contains non-numeric values, allowing all users")
+        return True
     return user_id in allowed
 
 
@@ -2422,13 +2461,13 @@ async def _telegram_run():
                 hrr = HolographicMemory(path=str(VAULT_DIR / "hrr_memory.json"))
                 novelty = hrr.novelty(convo_text)
                 if novelty >= 0.4:
-                    resp = client.messages.create(
+                    resp = await asyncio.to_thread(lambda: client.messages.create(
                         model=BRIDGE_MODEL_FAST, max_tokens=400,
                         messages=[{"role": "user", "content":
                             f"Summarize this Telegram conversation into a vault note. "
                             f"Key decisions, topics, action items. Use [[wikilinks]]. Under 200 words.\n\n{convo_text}"}],
                         timeout=60,
-                    )
+                    ))
                     note_content = _get_text(resp)
                     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
                     note_path = VAULT_DIR / "sessions" / f"tg_{vessel_name}_{ts}.md"
