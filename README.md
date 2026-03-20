@@ -61,7 +61,7 @@ tools/                 <- drop-in plugin tools
 .env                   <- API key + config
 ```
 
-## The 12 Sections
+## The 13 Sections
 
 | # | Section | What It Does |
 |---|---------|-------------|
@@ -77,6 +77,7 @@ tools/                 <- drop-in plugin tools
 | 10 | **Auto-Init** | TTY wizard or browser setup. First run creates everything. |
 | 11 | **Substrate** | Continuous memory transformation. Zero API cost. The unconscious. |
 | 12 | **Heartbeat + Main** | Periodic pulse. Background metabolism. Uvicorn startup. |
+| 13 | **Telegram Mode** | Per-user sessions. Vault commits. Safe tool filtering. |
 
 ---
 
@@ -84,8 +85,8 @@ tools/                 <- drop-in plugin tools
 
 ```bash
 # 1. Clone
-git clone https://github.com/user/the-bridge.git
-cd the-bridge
+git clone https://github.com/psiloceyeben/-BRIDGE.PY.git
+cd -- -BRIDGE.PY
 
 # 2. Set your API key
 cp .env.example .env
@@ -120,6 +121,16 @@ First run in terminal:
 ```
 
 You now have a cognitive AI with identity, routing, memory, habits, and metabolism.
+
+## Three Modes
+
+```bash
+python bridge.py              # Terminal REPL (default) â talk directly
+python bridge.py --serve      # HTTP server â API + web interface
+python bridge.py --telegram   # Telegram bot â reachable from any phone
+```
+
+Every mode runs the same architecture. Same identity, same habits, same vault, same routing. Three doors into the same mind.
 
 ---
 
@@ -251,6 +262,25 @@ BRIDGE_MODEL_FAST=anthropic/claude-haiku-4-5-20251001
 ```
 
 Same bridge.py. Same architecture. Different brain.
+
+---
+
+## Telegram
+
+Any vessel becomes a Telegram bot with one env var:
+
+```bash
+TELEGRAM_BOT_TOKEN=your-token-from-botfather
+TELEGRAM_ALLOWED_IDS=123456,789012  # optional, empty = anyone
+```
+
+```bash
+python bridge.py --telegram
+```
+
+Commands: `/start` `/clear` `/status`
+
+Every message routes through Hecate, habits learn from use, vault commits happen automatically every 10 messages when novelty is detected. Dangerous tools (file writes, shell commands) are auto-denied for safety â use the terminal for those.
 
 ---
 
