@@ -347,24 +347,38 @@ class HolographicMemory:
             data = json.loads(self.path.read_text())
             self.index = data.get("index", [])
             self.recall_counts = data.get("recall_counts", {})
-            self.memory = np.zeros(self.dim, dtype=complex)
-            for entry in self.index:
-                kv = _seed_vector(entry["key"], self.dim)
-                vv = _seed_vector(entry["value"], self.dim)
-                self.memory += _circular_conv(kv, vv)
+            # Restore saved memory vector if available
+            mem_data = data.get("memory")
+            if mem_data and len(mem_data) == self.dim:
+                self.memory = np.array([complex(r, i) for r, i in mem_data])
+            else:
+                # Rebuild from index (fallback for old format)
+                self.memory = np.zeros(self.dim, dtype=complex)
+                for entry in self.index:
+                    kv = _seed_vector(entry["key"], self.dim)
+                    vv = _seed_vector(entry["value"], self.dim)
+                    self.memory += _circular_conv(kv, vv)
             log.info(f"HRR loaded {len(self.index)} facts from {self.path}")
         except Exception as e:
             log.warning(f"HRR load error: {e}")
             self.memory = np.zeros(self.dim, dtype=complex)
             self.index = []
 
+    def reload(self):
+        """Reload from disk — call before modifying to avoid race conditions."""
+        if self.path and self.path.exists():
+            self._load()
+
     def _save(self):
         if not self.path:
             return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Serialize memory vector as list of [real, imag] pairs
+            mem_list = [[float(c.real), float(c.imag)] for c in self.memory]
             data = {
                 "version": 1, "dim": self.dim,
+                "memory": mem_list,
                 "index": self.index, "recall_counts": self.recall_counts,
             }
             self.path.write_text(json.dumps(data, indent=2, default=str))
@@ -2023,6 +2037,9 @@ class Substrate:
         phase_idx = (self.cycle_count - 1) % len(self.phases)
         phase = self.phases[phase_idx]
 
+        # Reload from disk to pick up any new bindings from other code paths
+        self.hrr.reload()
+
         norm_before = float(np.linalg.norm(self.hrr.memory))
 
         if phase == "hebbian":
@@ -2136,6 +2153,63 @@ async def _substrate_loop():
         await asyncio.sleep(SUBSTRATE_INTERVAL)
 
 
+async def _hourly_vault_commit():
+    """Hourly background loop — commit all active sessions to HRR."""
+    await asyncio.sleep(3600)  # first run after 1 hour
+    while True:
+        try:
+            vessel_name = "VESSEL"
+            v_path = VESSEL_DIR / "VESSEL.md"
+            if v_path.exists():
+                for line in v_path.read_text().split("\n"):
+                    if line.startswith("# "):
+                        vessel_name = line[2:].strip()
+                        break
+
+            committed = 0
+            for session_id, history in list(_chat_sessions.items()):
+                if len(history) < 2:
+                    continue
+                convo_lines = []
+                for msg in history[-20:]:
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+                    convo_lines.append(f"{msg.get('role', '?')}: {str(content)[:300]}")
+                convo_text = "\n".join(convo_lines)
+                hrr = HolographicMemory(path=str(VAULT_DIR / "hrr_memory.json"))
+                novelty = hrr.novelty(convo_text)
+                if novelty >= 0.4:
+                    try:
+                        resp = await asyncio.to_thread(lambda ct=convo_text: client.messages.create(
+                            model=BRIDGE_MODEL_FAST, max_tokens=400,
+                            messages=[{"role": "user", "content":
+                                f"Summarize this conversation into a vault note. "
+                                f"Key decisions, topics, action items. Use [[wikilinks]]. Under 200 words.\n\n{ct}"}],
+                            timeout=60,
+                        ))
+                        note_content = _get_text(resp)
+                    except Exception:
+                        note_content = convo_text[:500]
+                    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
+                    note_path = VAULT_DIR / "sessions" / f"{vessel_name}_{ts}_{session_id[:8]}.md"
+                    note_path.parent.mkdir(parents=True, exist_ok=True)
+                    note_path.write_text(
+                        f"---\ntags: [session, {vessel_name.lower()}]\n"
+                        f"vessel: {vessel_name}\nsession: {session_id}\n"
+                        f"date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n"
+                        f"novelty: {novelty:.2f}\n---\n\n"
+                        f"# Session\n\n{note_content}"
+                    )
+                    hrr.bind(f"hourly_{session_id}_{ts}", convo_text[:500],
+                             metadata={"vessel": vessel_name, "session": session_id})
+                    committed += 1
+            log.info(f"HOURLY COMMIT: {committed} sessions committed ({len(_chat_sessions)} active, {len(hrr.index) if committed else '?'} total bindings)")
+        except Exception as e:
+            log.warning(f"HOURLY COMMIT failed: {e}")
+        await asyncio.sleep(3600)
+
+
 @app.on_event("startup")
 async def startup():
     """Initialize everything and start background loops + Telegram if token exists."""
@@ -2147,6 +2221,7 @@ async def startup():
     if (VESSEL_DIR / "VESSEL.md").exists():
         asyncio.create_task(_heartbeat_loop())
         asyncio.create_task(_substrate_loop())
+        asyncio.create_task(_hourly_vault_commit())
         log.info("BRIDGE started: " + read(VESSEL_DIR / "VESSEL.md").split("\n")[0])
 
         # Auto-start Telegram bot if token is configured
@@ -2180,6 +2255,7 @@ async def _cli_loop():
     # Start background loops
     asyncio.create_task(_heartbeat_loop())
     asyncio.create_task(_substrate_loop())
+    asyncio.create_task(_hourly_vault_commit())
 
     ctx = load_vessel()
     vessel_name = "VESSEL"
@@ -2627,43 +2703,6 @@ async def _telegram_run():
             await update.message.reply_text(f"Error: {type(e).__name__}: {str(e)[:200]}")
             if history and history[-1].get("role") == "user":
                 history.pop()
-
-        # Vault commit — every 10 messages, check novelty and save
-        if len(history) >= 4 and len(history) % 4 == 0:
-            try:
-                convo_lines = []
-                for msg in history[-20:]:
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
-                    convo_lines.append(f"{msg.get('role', '?')}: {str(content)[:300]}")
-                convo_text = "\n".join(convo_lines)
-                hrr = HolographicMemory(path=str(VAULT_DIR / "hrr_memory.json"))
-                novelty = hrr.novelty(convo_text)
-                if novelty >= 0.4:
-                    resp = await asyncio.to_thread(lambda: client.messages.create(
-                        model=BRIDGE_MODEL_FAST, max_tokens=400,
-                        messages=[{"role": "user", "content":
-                            f"Summarize this Telegram conversation into a vault note. "
-                            f"Key decisions, topics, action items. Use [[wikilinks]]. Under 200 words.\n\n{convo_text}"}],
-                        timeout=60,
-                    ))
-                    note_content = _get_text(resp)
-                    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
-                    note_path = VAULT_DIR / "sessions" / f"tg_{vessel_name}_{ts}.md"
-                    note_path.parent.mkdir(parents=True, exist_ok=True)
-                    note_path.write_text(
-                        f"---\ntags: [session, telegram, {vessel_name.lower()}]\n"
-                        f"vessel: {vessel_name}\nuser: {uid}\n"
-                        f"date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n"
-                        f"novelty: {novelty:.2f}\n---\n\n"
-                        f"# Telegram Session\n\n{note_content}"
-                    )
-                    hrr.bind(f"tg_{session_id}_{len(history)}", convo_text[:500],
-                             metadata={"vessel": vessel_name, "channel": "telegram"})
-                    log.info(f"TELEGRAM: vault commit for user {uid} (novelty: {novelty:.2f})")
-            except Exception as e:
-                log.warning(f"TELEGRAM vault commit failed: {e}")
 
     # Build the bot
     app_tg = Application.builder().token(TELEGRAM_TOKEN).build()
